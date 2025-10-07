@@ -23,24 +23,24 @@ class GptRealtimeAudioTrack(AudioStreamTrack):
         self.gpt_realtime_video_track = gpt_realtime_video_track  # Reference to update visualization
 
         # Chunk size for 20ms at 24kHz (480 samples * 2 bytes per sample)
-        self.chunk_size_bytes = 480 * 2  # 20ms chunks
+        self.chunk_size_bytes = 960 * 2  # 20ms chunks
 
         # Buffer management
         self.audio_buffer = bytearray()
         self.buffer_lock = asyncio.Lock()
         self.frame_count = 0
         self.max_buffer_size = sample_rate * 2 * 30  # 30 seconds max
-        self.min_buffer_threshold = self.chunk_size_bytes * 3  # Keep 3 chunks minimum
+        self.min_buffer_threshold = self.chunk_size_bytes * 6  # Keep 3 chunks minimum
 
         # Audio batching for performance
         self.batch_buffer = bytearray()
-        self.batch_size = self.chunk_size_bytes * 4  # Batch 4 chunks at a time (80ms)
+        self.batch_size = self.chunk_size_bytes * 6  # Batch 4 chunks at a time (80ms)
         self.last_batch_time = time.time()
-        self.batch_timeout = 0.040  # Force batch processing after 40ms max
+        self.batch_timeout = 0.080  # Force batch processing after 40ms max
 
         # WebRTC stats debugging
         self.last_stats_time = 0
-        self.stats_interval = 5.0  # Print stats every 5 seconds
+        self.stats_interval = 30.0  # Print stats every 5 seconds
         self.peer_connection = None  # Will be set externally
         self.avg_fps = 0
 
@@ -49,6 +49,10 @@ class GptRealtimeAudioTrack(AudioStreamTrack):
         self.bytes_processed = 0
         self.buffer_empty_count = 0
         self.start_time = time.time()
+
+        self.adaptive_buffer_size = self.chunk_size_bytes * 10  # Start with 400ms buffer
+        self.network_samples = []
+        self.last_adaptation_time = 0
 
         # Fixed timing for consistent audio frame rate
         self.target_fps = 50.0  # Target 50 FPS (20ms chunks)
@@ -61,6 +65,16 @@ class GptRealtimeAudioTrack(AudioStreamTrack):
         """Set the peer connection for stats collection"""
         self.peer_connection = pc
         logger.info(f"🔗 Peer connection set for WebRTC stats: {pc is not None}")
+
+    def _adapt_buffer_for_ec2(self):
+        """Adapt buffer size based on performance metrics"""
+        if self.buffer_empty_count > self.frames_sent * 0.1:  # > 10% empty rate
+            # Increase buffer size
+            self.min_buffer_threshold = min(
+                self.min_buffer_threshold * 1.5, 
+                self.chunk_size_bytes * 12  # Max 480ms buffer
+            )
+        logger.info(f"📦 Increased buffer threshold to {self.min_buffer_threshold//self.chunk_size_bytes} chunks")
 
     async def _print_debug_stats(self):
         """Print WebRTC and performance stats every 5 seconds"""
@@ -130,12 +144,16 @@ class GptRealtimeAudioTrack(AudioStreamTrack):
             # Convert bytes to numpy array
             audio_array = np.frombuffer(chunk_data, dtype=np.int16)
 
-            # Update video visualization based on this audio chunk
-            if self.gpt_realtime_video_track and len(audio_array) > 0:
-                # Calculate RMS level for visualization
-                rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
-                normalized_level = min(rms / 2000.0, 1.0)
-                self.gpt_realtime_video_track.update_audio_level(normalized_level)
+            # Skip RMS calculation for visualization if high CPU usage detected
+            if self.avg_fps < 20:  # If performance is poor
+                # Skip video visualization updates
+                pass
+            else:
+                # Normal RMS calculation for video
+                if self.gpt_realtime_video_track and len(audio_array) > 0:
+                    rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+                    normalized_level = min(rms / 2000.0, 1.0)
+                    self.gpt_realtime_video_track.update_audio_level(normalized_level)
 
             # Create AudioFrame
             frame = AudioFrame.from_ndarray(audio_array.reshape(1, -1), format="s16", layout="mono")
@@ -149,9 +167,9 @@ class GptRealtimeAudioTrack(AudioStreamTrack):
             self.frame_count += len(audio_array)
 
             # Fixed timing to maintain proper audio frame rate
-            target_sleep = 0.015  # 20ms = 50 FPS
+            target_sleep = 0.030  # 20ms = 50 FPS
 
-            if self.avg_fps >= 50:
+            if self.avg_fps >= 25:
                 if buffer_was_empty:
                     # When buffer is empty, we can sleep a bit longer to reduce CPU usage
                     await asyncio.sleep(target_sleep)
